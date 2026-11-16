@@ -120,9 +120,83 @@ button {
   align-items: start;
 }
 
+.connect-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1.3fr) minmax(220px, .7fr);
+  align-items: center;
+  gap: 24px;
+  margin-bottom: 22px;
+  background: #f7f2e8;
+}
+
+.connect-card h2 {
+  margin: 0 0 4px;
+  font-size: 20px;
+}
+
+.connect-card p {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.connect-copy { min-width: 0; }
+.connect-body { min-width: 0; }
+
+.connect-form { min-width: 0; }
+
+.retry-connect { margin-left: 8px; padding: 5px 11px; min-height: 32px; }
+
+.connect-input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.connect-input input {
+  width: 100%;
+  min-width: 0;
+  flex: 1;
+  border: 1px solid var(--line);
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 9px 11px;
+  color: var(--ink);
+  outline: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.connect-input input:focus {
+  border-color: var(--green);
+  box-shadow: 0 0 0 3px rgba(111, 154, 120, .16);
+}
+
+.port-label {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.port-label output { color: var(--ink); }
+
+.connect-link-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-top: 10px;
+}
+
+.connect-link-row button { flex-shrink: 0; }
+.connect-link-row button:disabled { opacity: .5; cursor: not-allowed; }
+
 @media (max-width: 860px) {
   .grid { grid-template-columns: 1fr; }
   .masthead { align-items: flex-start; flex-direction: column; }
+  .connect-card { grid-template-columns: minmax(0, 1fr) 190px; gap: 18px; }
+  .connect-input { flex-wrap: wrap; }
+  .connect-input input { flex-basis: calc(100% - 70px); }
 }
 
 .card {
@@ -327,60 +401,50 @@ button {
   text-align: center;
 }
 
-.connect-panel {
-  border: 1px solid var(--line);
-  border-radius: 20px;
-  padding: 16px;
-  background: var(--panel-soft);
-  margin-top: 16px;
-}
-
-.connect-list {
-  display: grid;
-  gap: 8px;
-  margin-top: 12px;
-}
-
-.connect-row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-
 .connect-link {
   flex: 1;
-  min-width: 220px;
+  min-width: 0;
   border: 1px solid var(--line);
   border-radius: 12px;
   padding: 9px 10px;
   background: var(--panel);
   word-break: break-all;
   font-size: 12px;
+  user-select: all;
 }
 
 .qr-wrap {
   display: grid;
   place-items: center;
   gap: 8px;
-  margin-top: 14px;
+  min-width: 0;
+  min-height: 176px;
+  padding: 10px;
+  border-radius: 18px;
+  background: var(--panel);
+  color: var(--muted);
+  text-align: center;
+  font-size: 13px;
+  overflow: hidden;
 }
 
 .qr-wrap img {
-  width: 220px;
-  height: 220px;
-  border-radius: 18px;
+  display: block;
+  width: min(176px, 100%);
+  height: auto;
+  aspect-ratio: 1;
+  border-radius: 8px;
   background: #faf7f0;
 }
 
-.field-label, .fallback-copy label {
+.field-label {
   display: block;
   margin-bottom: 8px;
   color: var(--muted);
   font-size: 13px;
 }
 
-.host-select, .fallback-copy textarea, .selectable-content {
+.selectable-content {
   width: 100%;
   border: 1px solid var(--line);
   border-radius: 12px;
@@ -390,8 +454,6 @@ button {
   font: inherit;
 }
 
-.fallback-copy { margin-top: 10px; }
-.fallback-copy textarea, .selectable-content { min-height: 80px; resize: vertical; }
 .selectable-content { min-height: 150px; margin-bottom: 14px; }
 .image-failed { border-radius: 14px; background: var(--panel-soft); padding: 20px; color: var(--muted); }
 
@@ -478,4 +540,10 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   .shell { width: min(100% - 20px, 1120px); padding-top: 18px; }
   .card { padding: 16px; border-radius: 20px; }
   .actions > button { flex: 1; }
+  .connect-card { grid-template-columns: 1fr; gap: 12px; }
+  .qr-wrap { min-height: 156px; width: 100%; }
+  .qr-wrap img { width: 156px; }
+  .connect-input input { flex-basis: 100%; }
+  .connect-link-row { align-items: stretch; flex-direction: column; }
+  .connect-link-row button { min-height: 36px; }
 }

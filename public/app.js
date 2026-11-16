@@ -18,6 +18,8 @@ const state = {
   accessCode: '',
   pollTimer: null,
   pollGeneration: 0,
+  qrGeneration: 0,
+  connectUrl: '',
   maxItemBytes: 20 * 1024 * 1024,
   maxTextChars: 20_000,
 };
@@ -169,6 +171,16 @@ function renderShell() {
       </div>
       <div class="status offline"><span class="status-dot"></span><span class="status-label">正在连接</span></div>
     </header>
+    <section class="card connect-card" aria-labelledby="connect-title">
+      <div class="connect-copy">
+        <div>
+          <h2 id="connect-title">手机扫码，继续传</h2>
+          <p>手机与电脑连在同一 Wi-Fi 后扫一扫。</p>
+        </div>
+        <div class="connect-body" id="connect-body">正在获取局域网地址…</div>
+      </div>
+      <div class="qr-wrap" id="qr-wrap" aria-live="polite"></div>
+    </section>
     <section class="grid">
       <div class="card send-card">
         <h2>发送到共享收件箱</h2>
@@ -193,10 +205,6 @@ function renderShell() {
         <input type="file" id="file-input" accept="image/png,image/jpeg,image/gif,image/webp,image/avif,image/heic,image/heif" multiple hidden>
         <div class="upload-list" id="upload-list"></div>
         <div class="hint">支持 PNG / JPEG / GIF / WebP / AVIF / HEIC，单个最大 20 MiB，文字最多 2 万字符；图片和文字共用 512 MiB 总存储。</div>
-        <div class="connect-panel">
-          <button class="ghost" id="toggle-connect">连接其他设备</button>
-          <div id="connect-body" class="hidden"></div>
-        </div>
       </div>
       <div class="card inbox-card">
         <div class="inbox-head">
@@ -211,7 +219,7 @@ function renderShell() {
   $app.append(app);
   bindShell();
   bindDevice();
-  bindConnect();
+  renderConnect();
   renderItems();
 }
 
@@ -286,103 +294,202 @@ function bindPaste() {
 }
 
 function bindConnect() {
-  document.querySelector('#toggle-connect').addEventListener('click', async () => {
-    const body = document.querySelector('#connect-body');
-    body.classList.toggle('hidden');
-    if (!body.classList.contains('hidden')) await renderConnect();
+  const input = document.querySelector('#connect-host');
+  if (!input) return;
+  input.addEventListener('input', () => scheduleQr());
+  input.addEventListener('change', () => scheduleQr());
+  document.querySelector('#connect-form').addEventListener('submit', (event) => {
+    event.preventDefault();
+    scheduleQr();
+  });
+  document.querySelector('#copy-link').addEventListener('click', async () => {
+    if (!state.connectUrl) return;
+    try {
+      await copyText(state.connectUrl);
+      toast('链接已复制');
+    } catch {
+      showSelectableText(state.connectUrl);
+      toast('复制失败，请手动选择链接');
+    }
   });
 }
 
-async function renderConnect() {
+function showConnectForm(hosts) {
   const body = document.querySelector('#connect-body');
-  body.innerHTML = '正在生成本机地址…';
+  const current = locationHostname();
+  const preferred = hosts.includes(current) ? current : hosts[0] || '';
+  body.innerHTML = `
+    <form id="connect-form" class="connect-form" novalidate>
+      <label for="connect-host" class="field-label">局域网 IP</label>
+      <div class="connect-input">
+        <input id="connect-host" list="lan-hosts" value="${escapeAttr(preferred)}" autocomplete="off" spellcheck="false" aria-describedby="connect-hint">
+        <datalist id="lan-hosts">${hosts.map((host) => `<option value="${escapeAttr(host)}"></option>`).join('')}</datalist>
+        <span class="port-label">端口 <output id="connect-port">${escapeAttr(connectionPort())}</output></span>
+        <button class="primary" type="submit">生成</button>
+      </div>
+      <div class="hint" id="connect-hint" role="status">输入 IP 后自动生成，按 Enter 可立即重试；二维码包含访问令牌。</div>
+    </form>
+    <div class="connect-link-row">
+      <span class="connect-link" id="connect-link" aria-live="polite">请选择本机局域网 IP</span>
+      <button class="ghost" id="copy-link" type="button" disabled>复制链接</button>
+    </div>
+  `;
+  bindConnect();
+}
+
+async function renderConnect() {
+  const generation = ++state.qrGeneration;
+  const body = document.querySelector('#connect-body');
+  const qrWrap = document.querySelector('#qr-wrap');
+  if (!body || !qrWrap) return;
+  clearQr(qrWrap, '正在获取本机地址…');
+  body.innerHTML = '正在获取局域网地址…';
+  let response;
   let data;
   try {
-    const response = await api('/api/state');
-    data = await response.json();
-    if (!response.ok) throw new Error(data.error || '无法获得本机地址');
+    response = await api('/api/state');
+    data = await response.json().catch(() => ({}));
+    if (generation !== state.qrGeneration) return;
+    if (!response.ok) {
+      const error = new Error(data.error || '无法获得本机地址');
+      error.status = response.status;
+      throw error;
+    }
   } catch (error) {
+    if (generation !== state.qrGeneration) return;
     await handleAuthError(error);
-    body.textContent = error.message || '无法获得本机地址';
+    if (generation !== state.qrGeneration) return;
+    body.innerHTML = '<span role="alert">地址获取失败，暂时无法生成二维码。</span><button class="ghost retry-connect" type="button">重试</button>';
+    body.querySelector('.retry-connect').addEventListener('click', renderConnect);
+    clearQr(qrWrap, '暂时无法生成二维码');
     return;
   }
   const hosts = data.allowedHosts || [];
   if (!hosts.length) {
     body.textContent = '没有可用的局域网 IPv4 地址，请检查网络接口。';
+    clearQr(qrWrap, '没有可用的局域网地址');
     return;
   }
+  showConnectForm(hosts);
   const current = locationHostname();
-  const preferred = hosts.includes(current) ? current : hosts[0];
-  body.innerHTML = `
-    <label for="connect-host" class="field-label">这台电脑的局域网地址</label>
-    <select id="connect-host" class="host-select">${hosts.map((host) => `<option value="${escapeAttr(host)}" ${host === preferred ? 'selected' : ''}>${escapeAttr(host)}</option>`).join('')}</select>
-    <div class="hint">发给同一 Wi-Fi 下的另一台设备。链接中的访问令牌只在打开页面时使用。</div>
-    <div class="connect-row"><span class="connect-link" id="connect-link"></span><button class="ghost" id="copy-link">复制链接</button></div>
-    <div class="fallback-copy hidden" id="fallback-copy"><label for="fallback-link">复制失败，请手动选择链接</label><textarea id="fallback-link" readonly></textarea></div>
-    <div class="qr-wrap" id="qr-wrap"></div>
-  `;
-  const select = body.querySelector('#connect-host');
-  const link = body.querySelector('#connect-link');
-  const fallback = body.querySelector('#fallback-copy');
-  const fallbackInput = body.querySelector('#fallback-link');
-  const update = async (host) => {
-    const text = buildConnectUrl(host, state.token);
-    link.textContent = text;
-    fallbackInput.value = text;
-    fallback.classList.add('hidden');
-    await loadQr(host);
-  };
-  select.addEventListener('change', () => update(select.value));
-  body.querySelector('#copy-link').addEventListener('click', async () => {
-    try {
-      await copyText(link.textContent);
-      fallback.classList.add('hidden');
-      toast('链接已复制');
-    } catch {
-      fallback.classList.remove('hidden');
-      fallbackInput.focus();
-      fallbackInput.select();
-      toast('复制失败，请手动选择链接');
-    }
-  });
-  await update(preferred);
+  scheduleQr(hosts.includes(current) ? current : hosts[0], hosts);
 }
 
-async function loadQr(host) {
+let qrTimer = null;
+function scheduleQr(host = document.querySelector('#connect-host')?.value, allowedHosts) {
+  clearTimeout(qrTimer);
+  qrTimer = null;
+  const generation = ++state.qrGeneration;
+  const body = document.querySelector('#connect-body');
   const qrWrap = document.querySelector('#qr-wrap');
-  releaseQrUrl();
-  if (!qrWrap || !host) return;
-  qrWrap.dataset.host = host;
-  qrWrap.dataset.loaded = '';
-  qrWrap.textContent = '正在生成二维码…';
+  if (!body || !qrWrap) return;
+  state.connectUrl = '';
+  const link = body.querySelector('#connect-link');
+  const copyButton = body.querySelector('#copy-link');
+  if (link) link.textContent = '';
+  if (copyButton) copyButton.disabled = true;
+  const hint = body.querySelector('#connect-hint');
+  if (hint) hint.textContent = '输入 IP 后自动生成，按 Enter 可立即重试；二维码包含访问令牌。';
+  clearQr(qrWrap, '正在生成二维码…');
+  qrTimer = setTimeout(() => loadQr(host, generation, allowedHosts), 200);
+}
+
+async function loadQr(host, generation, allowedHosts) {
+  const normalizedHost = String(host || '').trim();
+  const body = document.querySelector('#connect-body');
+  const qrWrap = document.querySelector('#qr-wrap');
+  if (!body || !qrWrap || generation !== state.qrGeneration) return;
+  const hint = body.querySelector('#connect-hint');
+  if (!normalizedHost) {
+    if (hint) hint.textContent = '请输入局域网 IP 地址';
+    clearQr(qrWrap, '等待可用的局域网 IP');
+    return;
+  }
   try {
-    const response = await api(`/api/qr?host=${encodeURIComponent(host)}`);
+    const hosts = allowedHosts || await fetchAllowedHosts(generation);
+    if (generation !== state.qrGeneration) return;
+    if (!hosts.includes(normalizedHost)) {
+      throw new Error('这个 IP 不在本机允许的局域网地址中，请从提示地址选择或输入本机 IP。');
+    }
+    const response = await api(`/api/qr?host=${encodeURIComponent(normalizedHost)}`);
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
-      throw new Error(data.error || '二维码生成失败');
+      const error = new Error(data.error || '二维码生成失败，请检查 IP 后重试。');
+      error.status = response.status;
+      throw error;
     }
     const blob = await response.blob();
-    state.qrUrl = URL.createObjectURL(blob);
+    if (generation !== state.qrGeneration) return;
+    if (!blob.type.startsWith('image/')) throw new Error('二维码响应格式不正确，请重试。');
+    const image = await loadQrImage(blob, normalizedHost);
+    if (generation !== state.qrGeneration) return;
+    const objectUrl = URL.createObjectURL(blob);
+    image.src = objectUrl;
+    releaseQrUrl();
+    state.qrUrl = objectUrl;
+    qrWrap.dataset.host = normalizedHost;
+    qrWrap.dataset.loaded = 'true';
+    qrWrap.replaceChildren(image);
+    state.connectUrl = buildConnectUrl(normalizedHost, state.token);
+    body.querySelector('#connect-link').textContent = state.connectUrl;
+    body.querySelector('#copy-link').disabled = false;
+    if (hint) hint.textContent = '二维码和链接已按此地址生成。';
+  } catch (error) {
+    if (generation !== state.qrGeneration) return;
+    await handleAuthError(error);
+    if (generation !== state.qrGeneration) return;
+    state.connectUrl = '';
+    if (hint) hint.textContent = error.message || '二维码生成失败，请检查 IP 后重试。';
+    clearQr(qrWrap, '暂无可用的连接二维码');
+    body.querySelector('#connect-link').textContent = '';
+    body.querySelector('#copy-link').disabled = true;
+  }
+}
+
+async function fetchAllowedHosts(generation) {
+  const response = await api('/api/state');
+  const data = await response.json().catch(() => ({}));
+  if (generation !== state.qrGeneration) return [];
+  if (!response.ok) {
+    const error = new Error(data.error || '无法验证局域网地址');
+    error.status = response.status;
+    throw error;
+  }
+  return data.allowedHosts || [];
+}
+
+function loadQrImage(blob, host) {
+  return new Promise((resolve, reject) => {
     const image = new Image();
+    const objectUrl = URL.createObjectURL(blob);
     image.alt = `使用 ${host} 连接的二维码`;
-    image.src = state.qrUrl;
     image.addEventListener('load', () => {
-      qrWrap.dataset.loaded = 'true';
+      resolve(image);
+      queueMicrotask(() => URL.revokeObjectURL(objectUrl));
     }, { once: true });
     image.addEventListener('error', () => {
-      releaseQrUrl();
-      qrWrap.textContent = '二维码图片加载失败';
-    });
-    qrWrap.replaceChildren(image);
-  } catch (error) {
-    qrWrap.textContent = error.message || '二维码生成失败';
-  }
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('二维码图片加载失败'));
+    }, { once: true });
+    image.src = objectUrl;
+  });
+}
+
+function clearQr(qrWrap, message) {
+  releaseQrUrl();
+  delete qrWrap.dataset.host;
+  delete qrWrap.dataset.loaded;
+  qrWrap.textContent = message;
+}
+
+function connectionPort() {
+  return location.port || '80';
 }
 
 function buildConnectUrl(host, token) {
   const suffix = token ? `#token=${encodeURIComponent(token)}` : '';
   const safeHost = host.includes(':') ? `[${host}]` : host;
-  return `http://${safeHost}${location.port ? `:${location.port}` : ''}/${suffix}`;
+  return `http://${safeHost}:${connectionPort()}/${suffix}`;
 }
 
 function locationHostname() {
