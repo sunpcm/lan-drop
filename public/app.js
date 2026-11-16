@@ -174,16 +174,6 @@ function renderShell() {
         <div class="status offline"><span class="status-dot"></span><span class="status-label">正在连接</span></div>
       </div>
     </header>
-    <section class="card connect-card" aria-labelledby="connect-title">
-      <div class="connect-copy">
-        <div>
-          <h2 id="connect-title">手机扫码，继续传</h2>
-          <p>手机与电脑连在同一 Wi-Fi 后扫一扫。</p>
-        </div>
-        <div class="connect-body" id="connect-body">正在获取局域网地址…</div>
-      </div>
-      <div class="qr-wrap" id="qr-wrap" aria-live="polite"></div>
-    </section>
     <section class="grid">
       <div class="card send-card">
         <h2>发送到共享收件箱</h2>
@@ -218,6 +208,25 @@ function renderShell() {
         <div class="empty hidden" id="empty">还没有内容，发一条文字或图片试试。</div>
       </div>
     </section>
+    <details class="card connect-card" aria-labelledby="connect-title">
+      <summary class="connect-summary">
+        <span class="connect-summary-icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM16 16h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z"/></svg>
+        </span>
+        <span class="connect-summary-copy">
+          <span class="connect-summary-title" id="connect-title">手机扫码连接</span>
+          <span class="connect-summary-hint">手机与电脑连在同一 Wi-Fi 后展开扫码</span>
+        </span>
+        <svg class="connect-chevron" viewBox="0 0 24 24" aria-hidden="true"><path d="m7 10 5 5 5-5"/></svg>
+      </summary>
+      <div class="connect-content">
+        <div class="connect-copy">
+          <p>默认使用当前访问地址或首个本机局域网 IP，也可以手动修改。</p>
+          <div class="connect-body" id="connect-body">正在获取局域网地址…</div>
+        </div>
+        <div class="qr-wrap" id="qr-wrap" aria-live="polite"></div>
+      </div>
+    </details>
   `;
   $app.append(app);
   bindShell();
