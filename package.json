@@ -1,0 +1,18 @@
+{
+  "name": "lan-drop",
+  "version": "1.0.0",
+  "description": "局域网内轻量互传文字和图片的中文小工具",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node server/index.js",
+    "test": "node --test",
+    "check": "node --check server/index.js && node --check server/app.js && node --check server/config.js && node --check server/store.js && node --check server/security.js && node --check public/app.js"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  }
+}
