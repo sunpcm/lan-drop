@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import QRCode from 'qrcode';
 import { Store, buildPublicImage, buildPublicText, isProbablyImage } from './store.js';
+import { AuthManager, hasStoredCredential, isValidNewSecret } from './auth.js';
 import {
   createAccessCode,
   createToken,
@@ -115,12 +116,28 @@ function publicItem(item) {
 }
 
 function mount(mainApp) {
-  const { config, store, auth, state } = mainApp;
+  const { config, store, authManager, state } = mainApp;
 
   function authenticate(req) {
-    if (!timingSafeEqualString(bearerToken(req), auth.token)) {
+    if (!timingSafeEqualString(bearerToken(req), authManager.getToken())) {
       throw new ClientError(401, '连接已失效，请重新输入访问码');
     }
+  }
+
+  function credentialStillValid(token) {
+    return timingSafeEqualString(token, authManager.getToken());
+  }
+
+  function assertCredentialStillValid(token) {
+    if (!credentialStillValid(token)) {
+      throw new ClientError(401, '连接已失效，请重新输入访问码');
+    }
+  }
+
+  function withAuthorizationWrite(fn) {
+    const run = state.authorizationWrite.then(fn);
+    state.authorizationWrite = run.catch(() => {});
+    return run;
   }
 
   function enforceWrite(req) {
@@ -140,7 +157,7 @@ function mount(mainApp) {
       ok: true,
       allowedHosts: hosts,
       config: {
-        deviceId: auth.deviceId,
+        deviceId: authManager.getDeviceId(),
         maxItemBytes: config.maxItemBytes,
         maxTextChars: config.maxTextChars,
         maxTotalBytes: config.maxTotalBytes,
@@ -161,22 +178,65 @@ function mount(mainApp) {
       const raw = await readBody(req, JSON_LIMIT);
       let data;
       try { data = JSON.parse(raw.toString('utf8')); } catch { throw new ClientError(400, '请求格式错误'); }
-      const code = String(data?.code || '').trim().toUpperCase();
-      if (!timingSafeEqualString(code, auth.accessCode)) {
+      const expectedToken = authManager.getToken();
+      if (!await authManager.verifySecret(data?.code)) {
         limiter.failed(limiterKey);
         throw new ClientError(401, '访问码不正确');
       }
+      if (!credentialStillValid(expectedToken)) {
+        limiter.failed(limiterKey);
+        throw new ClientError(401, '访问凭据已更新，请重新进入');
+      }
       limiter.succeed(limiterKey);
+      const current = authManager.current();
       sendJson(res, 200, {
         ok: true,
-        token: auth.token,
-        accessCode: auth.accessCode,
-        deviceId: auth.deviceId,
+        token: current.token,
+        accessCode: current.accessCode,
+        deviceId: current.deviceId,
+      });
+      return;
+    }
+
+    if (pathname === '/api/access') {
+      if (req.method !== 'POST') deny();
+      enforceWrite(req);
+      authenticate(req);
+      const limiter = state.accessLimiter;
+      const limiterKey = req.socket.remoteAddress || 'unknown';
+      if (limiter.exhausted(limiterKey)) {
+        throw new ClientError(429, '尝试次数过多，请稍后再试', { 'retry-after': String(limiter.retryAfter(limiterKey)) });
+      }
+      const raw = await readBody(req, JSON_LIMIT);
+      let data;
+      try { data = JSON.parse(raw.toString('utf8')); } catch { throw new ClientError(400, '请求格式错误'); }
+      if (!isValidNewSecret(data?.newSecret)) {
+        throw new ClientError(400, '新密码需为 8–64 个字符，且不能全是空白');
+      }
+      await withAuthorizationWrite(async () => {
+        authenticate(req);
+        if (limiter.exhausted(limiterKey)) {
+          throw new ClientError(429, '尝试次数过多，请稍后再试', { 'retry-after': String(limiter.retryAfter(limiterKey)) });
+        }
+        if (!await authManager.verifySecret(data.currentSecret)) {
+          if (!limiter.failed(limiterKey)) {
+            throw new ClientError(429, '尝试次数过多，请稍后再试', { 'retry-after': String(limiter.retryAfter(limiterKey)) });
+          }
+          throw new ClientError(403, '当前密码不正确');
+        }
+        const updated = await authManager.rotate(data.newSecret);
+        limiter.succeed(limiterKey);
+        sendJson(res, 200, {
+          ok: true,
+          token: updated.token,
+          deviceId: updated.deviceId,
+        });
       });
       return;
     }
 
     authenticate(req);
+    const requestToken = bearerToken(req);
     if (pathname === '/api/state') {
       if (req.method !== 'GET') deny();
       sendJson(res, 200, stateResponse(req));
@@ -185,6 +245,7 @@ function mount(mainApp) {
     if (pathname === '/api/items') {
       if (req.method === 'GET') {
         const snapshot = await store.getSnapshot();
+        assertCredentialStillValid(requestToken);
         const supplied = Number(url.searchParams.get('revision'));
         if (Number.isSafeInteger(supplied) && supplied === snapshot.revision) {
           sendJson(res, 200, { ok: true, unchanged: true, revision: snapshot.revision });
@@ -211,23 +272,29 @@ function mount(mainApp) {
           try { text = new TextDecoder('utf-8', { fatal: true }).decode(body); } catch { throw new ClientError(400, '文字编码无效'); }
           if (!text.trim()) throw new ClientError(400, '请输入文字');
           if ([...text].length > config.maxTextChars) throw new ClientError(413, `文字超过 ${config.maxTextChars} 字符上限`);
-          const item = await store.addText(text);
-          sendJson(res, 201, { ok: true, revision: store.index.revision, item: publicItem(item) });
+          await withAuthorizationWrite(async () => {
+            assertCredentialStillValid(requestToken);
+            const item = await store.addText(text);
+            sendJson(res, 201, { ok: true, revision: store.index.revision, item: publicItem(item) });
+          });
           return;
         }
         const detectedType = isProbablyImage(body);
         if (!detectedType || !contentType.startsWith('image/')) throw new ClientError(415, '仅支持安全的 PNG、JPEG、GIF、WebP、AVIF 或 HEIC 图片');
         const sourceName = safeDecodedName(req.headers['x-file-name']);
-        const item = await store.addImage({
-          buffer: body,
-          originalName: /\.(png|jpe?g|gif|webp|avif|heic|heif)$/i.test(sourceName)
-            ? sourceName
-            : `${sourceName.replace(/\.[^.]+$/, '')}${extensionForMime(detectedType)}`,
-          mimeType: contentType,
-          detectedType,
-          bytesRead: body.length,
+        await withAuthorizationWrite(async () => {
+          assertCredentialStillValid(requestToken);
+          const item = await store.addImage({
+            buffer: body,
+            originalName: /\.(png|jpe?g|gif|webp|avif|heic|heif)$/i.test(sourceName)
+              ? sourceName
+              : `${sourceName.replace(/\.[^.]+$/, '')}${extensionForMime(detectedType)}`,
+            mimeType: contentType,
+            detectedType,
+            bytesRead: body.length,
+          });
+          sendJson(res, 201, { ok: true, revision: store.index.revision, item: publicItem(item) });
         });
-        sendJson(res, 201, { ok: true, revision: store.index.revision, item: publicItem(item) });
         return;
       }
       deny();
@@ -237,6 +304,7 @@ function mount(mainApp) {
     if (itemMatch) {
       if (req.method !== 'GET') deny();
       const item = await store.getItem(itemMatch[1]);
+      assertCredentialStillValid(requestToken);
       if (!item) throw new ClientError(404, '内容不存在或已过期');
       const action = itemMatch[2] || '';
       if (!action) {
@@ -254,6 +322,7 @@ function mount(mainApp) {
         if (error.code === 'ENOENT') throw new ClientError(404, '图片文件不存在');
         throw error;
       }
+      assertCredentialStillValid(requestToken);
       const headers = {
         'content-type': item.mimeType,
         'content-length': data.length,
@@ -270,9 +339,12 @@ function mount(mainApp) {
     if (deleteMatch) {
       if (req.method !== 'POST') deny();
       enforceWrite(req);
-      const removed = await store.deleteItem(deleteMatch[1]);
-      if (!removed) throw new ClientError(404, '内容不存在或已过期');
-      sendJson(res, 200, { ok: true, revision: store.index.revision });
+      await withAuthorizationWrite(async () => {
+        assertCredentialStillValid(requestToken);
+        const removed = await store.deleteItem(deleteMatch[1]);
+        if (!removed) throw new ClientError(404, '内容不存在或已过期');
+        sendJson(res, 200, { ok: true, revision: store.index.revision });
+      });
       return;
     }
 
@@ -281,14 +353,16 @@ function mount(mainApp) {
       const requestedHost = String(url.searchParams.get('host') || '').trim();
       if (!isAllowedQrHost(mainApp, requestedHost)) throw new ClientError(400, '二维码地址不可用');
       const port = portFromHost(req.headers.host);
-      const urlText = `http://${formatUrlHost(requestedHost)}:${port}/#token=${encodeURIComponent(auth.token)}`;
+      const urlText = `http://${formatUrlHost(requestedHost)}:${port}/#token=${encodeURIComponent(authManager.getToken())}`;
+      let image;
       try {
-        const image = await QRCode.toBuffer(urlText, { type: 'png', width: 480, margin: 2, errorCorrectionLevel: 'M' });
-        res.writeHead(200, { 'content-type': 'image/png', 'content-length': image.length, 'cache-control': 'no-store' });
-        res.end(image);
+        image = await QRCode.toBuffer(urlText, { type: 'png', width: 480, margin: 2, errorCorrectionLevel: 'M' });
       } catch {
         throw new ClientError(500, '二维码生成失败');
       }
+      assertCredentialStillValid(requestToken);
+      res.writeHead(200, { 'content-type': 'image/png', 'content-length': image.length, 'cache-control': 'no-store' });
+      res.end(image);
       return;
     }
     throw new ClientError(404, '接口不存在');
@@ -458,25 +532,36 @@ export async function createApp({ config, baseDir = process.cwd(), store: suppli
   const store = suppliedStore || new Store(config);
   await store.init();
   let auth = await store.getAuth();
-  if (!auth?.accessCode || !auth?.token) {
+  if (!hasStoredCredential(auth)) {
     auth = {
       accessCode: createAccessCode(config.accessCodeLength),
-      token: createToken(config.tokenBytes),
+      token: createToken(Math.max(32, config.tokenBytes)),
       deviceId: `设备-${randomId(2)}`,
     };
     await store.saveAuth(auth);
   }
+  const authManager = new AuthManager({
+    store,
+    auth,
+    tokenBytes: Math.max(32, config.tokenBytes),
+  });
   const state = {
     limiter: AccessLimiter.fromConfig(config),
+    accessLimiter: AccessLimiter.fromConfig(config),
+    authorizationWrite: Promise.resolve(),
     interval: null,
   };
   const mainApp = {
     config,
     store,
-    auth,
+    authManager,
     state,
     publicDir: path.join(baseDir, 'public'),
   };
+  Object.defineProperty(mainApp, 'auth', {
+    enumerable: true,
+    get: () => authManager.current(),
+  });
   mainApp.handler = mount(mainApp);
   state.interval = setInterval(() => {
     store.cleanupExpired().catch((error) => console.error('过期清理失败', error));
@@ -487,6 +572,7 @@ export async function createApp({ config, baseDir = process.cwd(), store: suppli
       clearInterval(state.interval);
       state.interval = null;
     }
+    await state.authorizationWrite;
     await store.mutation;
   };
   return mainApp;

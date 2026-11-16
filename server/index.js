@@ -15,7 +15,7 @@ export async function main() {
   const actualPort = server.address().port;
   const addresses = localIPv4Addresses();
   console.log('LAN Drop / 隔空小站 已启动');
-  console.log(`访问码：${app.auth.accessCode}`);
+  console.log(app.auth.custom ? '密码：已自定义' : `访问码：${app.auth.accessCode}`);
   for (const address of addresses) {
     console.log(`  http://${address}:${actualPort}`);
   }

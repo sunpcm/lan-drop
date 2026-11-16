@@ -15,8 +15,8 @@ const state = {
   imageRequests: new Map(),
   qrUrl: '',
   connected: false,
-  accessCode: '',
   pollTimer: null,
+  pollResolve: null,
   pollGeneration: 0,
   qrGeneration: 0,
   connectUrl: '',
@@ -37,9 +37,10 @@ function toast(message) {
 }
 
 function api(path, options = {}) {
-  const headers = { ...(options.headers || {}) };
-  if (state.token) headers.authorization = `Bearer ${state.token}`;
-  return fetch(path, { ...options, headers });
+  const { token = state.token, ...fetchOptions } = options;
+  const headers = { ...(fetchOptions.headers || {}) };
+  if (token) headers.authorization = `Bearer ${token}`;
+  return fetch(path, { ...fetchOptions, headers });
 }
 
 function setStatus(text, mode) {
@@ -65,6 +66,7 @@ function timeAgo(ts) {
 
 function renderLock() {
   $app.innerHTML = '';
+  document.querySelectorAll('dialog[open]').forEach((dialog) => dialog.close());
   releaseImageUrls();
   cancelPolling();
   document.body.classList.remove('app-ready');
@@ -76,8 +78,8 @@ function renderLock() {
     <svg class="lock-icon" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="16" fill="#24332B"/><path d="M18 22h28v20H18z" fill="#FAF7F0"/><path d="M25 30l7 8 5-5 9 10" fill="none" stroke="#6F9A78" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><circle cx="44" cy="27" r="3" fill="#8ABF91"/></svg>
     <h1>隔空小站</h1>
     <p>把这一刻，传到另一台设备。</p>
-    <label for="access-code" class="visually-hidden">访问码</label>
-    <input id="access-code" class="code-input" maxlength="12" placeholder="输入访问码" autocomplete="one-time-code" inputmode="text" required>
+    <label for="access-code" class="visually-hidden">访问码或密码</label>
+    <input id="access-code" class="code-input" type="password" maxlength="128" placeholder="输入访问码或密码" autocomplete="current-password" autocapitalize="none" spellcheck="false" required>
     <div class="actions lock-actions"><button class="primary lock-submit" type="submit">进入</button></div>
     <div class="hint lock-error" id="lock-error"></div>
   `;
@@ -104,7 +106,6 @@ function renderLock() {
       }
       state.token = data.token;
       localStorage.setItem(TOKEN_KEY, state.token);
-      state.accessCode = data.accessCode;
       await startApp(data.deviceId);
     } catch {
       errorEl.textContent = '连接失败，请检查网络';
@@ -133,7 +134,6 @@ async function connectFromHash() {
       localStorage.removeItem(TOKEN_KEY);
       return false;
     }
-    state.accessCode = '';
     state.maxItemBytes = data.config.maxItemBytes;
     state.maxTextChars = data.config.maxTextChars;
     await startApp(data.deviceId);
@@ -169,7 +169,10 @@ function renderShell() {
           <p>把这一刻，传到另一台设备。</p>
         </div>
       </div>
-      <div class="status offline"><span class="status-dot"></span><span class="status-label">正在连接</span></div>
+      <div class="masthead-actions">
+        <button class="ghost access-settings-button" id="open-access-settings" type="button">设置密码</button>
+        <div class="status offline"><span class="status-dot"></span><span class="status-label">正在连接</span></div>
+      </div>
     </header>
     <section class="card connect-card" aria-labelledby="connect-title">
       <div class="connect-copy">
@@ -241,6 +244,7 @@ function bindShell() {
   });
   document.querySelector('#refresh').addEventListener('click', () => refreshItems(true));
   document.querySelector('#clear-all').addEventListener('click', clearAll);
+  document.querySelector('#open-access-settings').addEventListener('click', openAccessDialog);
   document.querySelector('#text-input').addEventListener('keydown', (event) => {
     if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') {
       event.preventDefault();
@@ -248,7 +252,6 @@ function bindShell() {
     }
   });
   bindDropzone();
-  bindPaste();
 }
 
 function bindDevice() {
@@ -277,6 +280,7 @@ function bindDropzone() {
 
 function bindPaste() {
   document.addEventListener('paste', (event) => {
+    if (!state.connected || document.querySelector('dialog[open]')) return;
     const files = [...(event.clipboardData?.files || [])].filter((file) => file.type.startsWith('image/'));
     if (files.length) {
       event.preventDefault();
@@ -291,6 +295,129 @@ function bindPaste() {
       toast('已粘贴文字，点发送即可');
     }
   });
+}
+
+function openAccessDialog() {
+  if (document.querySelector('.access-dialog')) return;
+  const dialog = document.createElement('dialog');
+  dialog.className = 'access-dialog';
+  dialog.setAttribute('aria-labelledby', 'access-dialog-title');
+  dialog.innerHTML = `
+    <form class="access-form" novalidate>
+      <div>
+        <h2 id="access-dialog-title">设置密码</h2>
+        <p>修改后，其他设备需要重新登录，旧二维码和旧连接会失效。</p>
+      </div>
+      <label class="field-label" for="current-secret">当前密码或访问码</label>
+      <input id="current-secret" class="dialog-input" type="password" maxlength="128" autocomplete="current-password" required>
+      <label class="field-label" for="new-secret">新密码</label>
+      <input id="new-secret" class="dialog-input" type="password" minlength="8" maxlength="128" autocomplete="new-password" aria-describedby="secret-rule" required>
+      <div class="hint secret-rule" id="secret-rule">8–64 个字符，区分大小写，不能全是空白。</div>
+      <label class="field-label" for="confirm-secret">确认新密码</label>
+      <input id="confirm-secret" class="dialog-input" type="password" minlength="8" maxlength="128" autocomplete="new-password" required>
+      <div class="access-error" id="access-settings-error" role="alert"></div>
+      <div class="actions access-actions">
+        <button class="ghost" id="cancel-access-settings" type="button">取消</button>
+        <button class="primary" id="save-access-settings" type="submit">保存新密码</button>
+      </div>
+    </form>
+  `;
+  const form = dialog.querySelector('form');
+  const currentInput = form.querySelector('#current-secret');
+  const newInput = form.querySelector('#new-secret');
+  const confirmInput = form.querySelector('#confirm-secret');
+  const errorEl = form.querySelector('#access-settings-error');
+  const submit = form.querySelector('#save-access-settings');
+
+  const clearInputs = () => {
+    currentInput.value = '';
+    newInput.value = '';
+    confirmInput.value = '';
+    errorEl.textContent = '';
+  };
+  dialog.addEventListener('close', () => {
+    clearInputs();
+    dialog.remove();
+  });
+  form.querySelector('#cancel-access-settings').addEventListener('click', () => dialog.close());
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    if (submit.disabled) return;
+    errorEl.textContent = '';
+    const newSecret = newInput.value;
+    const length = [...newSecret].length;
+    if (length < 8 || length > 64 || /^\s*$/u.test(newSecret)) {
+      errorEl.textContent = '新密码需为 8–64 个字符，且不能全是空白。';
+      newInput.focus();
+      return;
+    }
+    if (newSecret !== confirmInput.value) {
+      errorEl.textContent = '两次输入的新密码不一致。';
+      confirmInput.focus();
+      return;
+    }
+
+    submit.disabled = true;
+    submit.textContent = '正在保存…';
+    const requestToken = state.token;
+    try {
+      const response = await api('/api/access', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ currentSecret: currentInput.value, newSecret }),
+        token: requestToken,
+      });
+      const data = await response.json().catch(() => ({}));
+      if (requestToken !== state.token) return;
+      if (response.status === 401) {
+        dialog.close();
+        invalidateSession(data.error || '连接已失效，请重新输入访问码', requestToken);
+        return;
+      }
+      if (!response.ok || !data.ok || !data.token) {
+        errorEl.textContent = data.error || '密码修改失败，请重试。';
+        if (response.status === 429) errorEl.textContent += ' 请稍后再试。';
+        return;
+      }
+      dialog.close();
+      await switchSessionToken(data.token);
+      toast('密码已更新，其他设备需重新登录');
+    } catch {
+      errorEl.textContent = '密码修改失败，请检查网络后重试。';
+    } finally {
+      submit.disabled = false;
+      submit.textContent = '保存新密码';
+    }
+  });
+
+  document.body.append(dialog);
+  dialog.showModal();
+  currentInput.focus();
+}
+
+async function switchSessionToken(token) {
+  cancelPolling();
+  clearTimeout(qrTimer);
+  qrTimer = null;
+  state.qrGeneration += 1;
+  releaseImageUrls();
+  state.token = token;
+  localStorage.setItem(TOKEN_KEY, token);
+  state.revision = 0;
+  localStorage.removeItem(REVISION_KEY);
+  state.items = [];
+  state.connected = false;
+  state.connectUrl = '';
+  const uploads = document.querySelector('#upload-list');
+  if (uploads) uploads.replaceChildren();
+  renderItems();
+  setStatus('正在连接', 'offline');
+  await renderConnect();
+  await refreshItems(true, token);
+  if (state.token === token) {
+    cancelPolling();
+    pollLoop();
+  }
 }
 
 function bindConnect() {
@@ -339,6 +466,7 @@ function showConnectForm(hosts) {
 
 async function renderConnect() {
   const generation = ++state.qrGeneration;
+  const requestToken = state.token;
   const body = document.querySelector('#connect-body');
   const qrWrap = document.querySelector('#qr-wrap');
   if (!body || !qrWrap) return;
@@ -347,18 +475,18 @@ async function renderConnect() {
   let response;
   let data;
   try {
-    response = await api('/api/state');
+    response = await api('/api/state', { token: requestToken });
     data = await response.json().catch(() => ({}));
-    if (generation !== state.qrGeneration) return;
+    if (generation !== state.qrGeneration || requestToken !== state.token) return;
     if (!response.ok) {
       const error = new Error(data.error || '无法获得本机地址');
       error.status = response.status;
       throw error;
     }
   } catch (error) {
-    if (generation !== state.qrGeneration) return;
-    await handleAuthError(error);
-    if (generation !== state.qrGeneration) return;
+    if (generation !== state.qrGeneration || requestToken !== state.token) return;
+    await handleAuthError(error, requestToken);
+    if (generation !== state.qrGeneration || requestToken !== state.token) return;
     body.innerHTML = '<span role="alert">地址获取失败，暂时无法生成二维码。</span><button class="ghost retry-connect" type="button">重试</button>';
     body.querySelector('.retry-connect').addEventListener('click', renderConnect);
     clearQr(qrWrap, '暂时无法生成二维码');
@@ -395,6 +523,7 @@ function scheduleQr(host = document.querySelector('#connect-host')?.value, allow
 }
 
 async function loadQr(host, generation, allowedHosts) {
+  const requestToken = state.token;
   const normalizedHost = String(host || '').trim();
   const body = document.querySelector('#connect-body');
   const qrWrap = document.querySelector('#qr-wrap');
@@ -406,12 +535,12 @@ async function loadQr(host, generation, allowedHosts) {
     return;
   }
   try {
-    const hosts = allowedHosts || await fetchAllowedHosts(generation);
-    if (generation !== state.qrGeneration) return;
+    const hosts = allowedHosts || await fetchAllowedHosts(generation, requestToken);
+    if (generation !== state.qrGeneration || requestToken !== state.token) return;
     if (!hosts.includes(normalizedHost)) {
       throw new Error('这个 IP 不在本机允许的局域网地址中，请从提示地址选择或输入本机 IP。');
     }
-    const response = await api(`/api/qr?host=${encodeURIComponent(normalizedHost)}`);
+    const response = await api(`/api/qr?host=${encodeURIComponent(normalizedHost)}`, { token: requestToken });
     if (!response.ok) {
       const data = await response.json().catch(() => ({}));
       const error = new Error(data.error || '二维码生成失败，请检查 IP 后重试。');
@@ -419,10 +548,10 @@ async function loadQr(host, generation, allowedHosts) {
       throw error;
     }
     const blob = await response.blob();
-    if (generation !== state.qrGeneration) return;
+    if (generation !== state.qrGeneration || requestToken !== state.token) return;
     if (!blob.type.startsWith('image/')) throw new Error('二维码响应格式不正确，请重试。');
     const image = await loadQrImage(blob, normalizedHost);
-    if (generation !== state.qrGeneration) return;
+    if (generation !== state.qrGeneration || requestToken !== state.token) return;
     const objectUrl = URL.createObjectURL(blob);
     image.src = objectUrl;
     releaseQrUrl();
@@ -435,9 +564,9 @@ async function loadQr(host, generation, allowedHosts) {
     body.querySelector('#copy-link').disabled = false;
     if (hint) hint.textContent = '二维码和链接已按此地址生成。';
   } catch (error) {
-    if (generation !== state.qrGeneration) return;
-    await handleAuthError(error);
-    if (generation !== state.qrGeneration) return;
+    if (generation !== state.qrGeneration || requestToken !== state.token) return;
+    await handleAuthError(error, requestToken);
+    if (generation !== state.qrGeneration || requestToken !== state.token) return;
     state.connectUrl = '';
     if (hint) hint.textContent = error.message || '二维码生成失败，请检查 IP 后重试。';
     clearQr(qrWrap, '暂无可用的连接二维码');
@@ -446,10 +575,10 @@ async function loadQr(host, generation, allowedHosts) {
   }
 }
 
-async function fetchAllowedHosts(generation) {
-  const response = await api('/api/state');
+async function fetchAllowedHosts(generation, requestToken) {
+  const response = await api('/api/state', { token: requestToken });
   const data = await response.json().catch(() => ({}));
-  if (generation !== state.qrGeneration) return [];
+  if (generation !== state.qrGeneration || requestToken !== state.token) return [];
   if (!response.ok) {
     const error = new Error(data.error || '无法验证局域网地址');
     error.status = response.status;
@@ -528,13 +657,20 @@ async function sendText() {
   const button = document.querySelector('#send-text');
   if (button.disabled) return;
   button.disabled = true;
+  const requestToken = state.token;
   try {
     const res = await api('/api/items', {
       method: 'POST',
       headers: { 'content-type': 'text/plain; charset=utf-8' },
       body: text,
+      token: requestToken,
     });
     const data = await res.json().catch(() => ({}));
+    if (requestToken !== state.token) return;
+    if (res.status === 401) {
+      invalidateSession(data.error || '连接已失效，请重新输入访问码', requestToken);
+      return;
+    }
     if (!res.ok || !data.ok) throw new Error(data.error || '发送失败');
     textarea.value = '';
     state.revision = data.revision;
@@ -542,6 +678,7 @@ async function sendText() {
     await refreshItems(true);
     toast('已发送');
   } catch (error) {
+    if (requestToken !== state.token) return;
     toast(error.message || '发送失败');
   } finally {
     button.disabled = false;
@@ -572,12 +709,13 @@ async function uploadOne(file) {
     stateEl.textContent = '不是图片';
     return;
   }
+  const requestToken = state.token;
   try {
     const xhr = new XMLHttpRequest();
     const result = await new Promise((resolve, reject) => {
       xhr.open('POST', '/api/items');
       xhr.timeout = UPLOAD_TIMEOUT_MS;
-      if (state.token) xhr.setRequestHeader('authorization', `Bearer ${state.token}`);
+      if (requestToken) xhr.setRequestHeader('authorization', `Bearer ${requestToken}`);
       xhr.setRequestHeader('x-file-name', encodeURIComponent(file.name));
       xhr.setRequestHeader('content-type', file.type || 'application/octet-stream');
       xhr.upload.onprogress = (event) => {
@@ -590,7 +728,8 @@ async function uploadOne(file) {
       xhr.onload = () => {
         const contentType = xhr.getResponseHeader('content-type') || '';
         if (contentType.includes('application/json')) {
-          const data = JSON.parse(xhr.responseText || '{}');
+          let data = {};
+          try { data = JSON.parse(xhr.responseText || '{}'); } catch {}
           resolve({ ok: xhr.status >= 200 && xhr.status < 300, data });
         } else {
           resolve({ ok: xhr.status >= 200 && xhr.status < 300, data: {} });
@@ -600,10 +739,12 @@ async function uploadOne(file) {
       xhr.ontimeout = () => reject(new Error('上传超时'));
       xhr.onabort = () => reject(new Error('上传已取消'));
       xhr.onloadend = () => {
-        if (xhr.status === 401) invalidateSession('连接已失效，请重新输入访问码');
+        if (xhr.status === 401) invalidateSession('连接已失效，请重新输入访问码', requestToken);
       };
       xhr.send(file);
     });
+    if (requestToken !== state.token) return;
+    if (xhr.status === 401) return;
     if (!result.ok) throw new Error(result.data?.error || `上传失败（${xhr.status}）`);
     row.classList.add('ok');
     stateEl.textContent = '完成';
@@ -611,6 +752,7 @@ async function uploadOne(file) {
     localStorage.setItem(REVISION_KEY, state.revision);
     await refreshItems(true);
   } catch (error) {
+    if (requestToken !== state.token) return;
     row.classList.add('fail');
     stateEl.textContent = error.message || '上传失败';
   }
@@ -618,24 +760,27 @@ async function uploadOne(file) {
 
 async function clearAll() {
   if (!confirm('确定清空收件箱吗？此操作会删除这台设备上的所有内容。')) return;
+  const requestToken = state.token;
   const items = [...state.items];
-  const results = await Promise.all(items.map((item) => api(`/api/delete/${encodeURIComponent(item.id)}`, { method: 'POST' })));
+  const results = await Promise.all(items.map((item) => api(`/api/delete/${encodeURIComponent(item.id)}`, { method: 'POST', token: requestToken })));
+  if (requestToken !== state.token) return;
   if (results.some((res) => res.status === 401)) {
-    invalidateSession('连接已失效，请重新输入访问码');
+    invalidateSession('连接已失效，请重新输入访问码', requestToken);
     return;
   }
   if (results.some((res) => !res.ok && res.status !== 404)) toast('部分内容删除失败');
   await refreshItems(true);
 }
 
-async function refreshItems(force = false) {
+async function refreshItems(force = false, token = state.token) {
   const url = new URL('/api/items', location.origin);
   if (!force) url.searchParams.set('revision', String(state.revision));
   try {
-    const res = await api(url.pathname + url.search);
+    const res = await api(url.pathname + url.search, { token });
     const data = await res.json().catch(() => ({}));
+    if (token !== state.token) return;
     if (res.status === 401) {
-      invalidateSession(data.error || '连接已失效，请重新输入访问码');
+      invalidateSession(data.error || '连接已失效，请重新输入访问码', token);
       return;
     }
     if (!res.ok || !data.ok) throw new Error(data.error || '同步失败');
@@ -650,6 +795,7 @@ async function refreshItems(force = false) {
     setStatus('已连接', 'online');
     state.connected = true;
   } catch (error) {
+    if (token !== state.token) return;
     setStatus('连接中断', 'offline');
     state.connected = false;
     if (force) toast(error.message || '同步失败');
@@ -712,13 +858,20 @@ function buildItem(item) {
   copy.className = 'ghost';
   copy.textContent = item.kind === 'image' ? '复制图片' : '复制文字';
   copy.addEventListener('click', async () => {
+    const requestToken = state.token;
     try {
       if (item.kind === 'text') {
         await copyText(item.text);
       } else {
-        const res = await api(`/api/items/${encodeURIComponent(item.id)}/image`);
+        const res = await api(`/api/items/${encodeURIComponent(item.id)}/image`, { token: requestToken });
+        if (requestToken !== state.token) return;
+        if (res.status === 401) {
+          invalidateSession('连接已失效，请重新输入访问码', requestToken);
+          return;
+        }
         if (!res.ok) throw new Error('图片获取失败');
         const blob = await res.blob();
+        if (requestToken !== state.token) return;
         await copyImage(blob);
       }
       toast('已复制');
@@ -734,13 +887,20 @@ function buildItem(item) {
     download.textContent = '下载原图';
     download.addEventListener('click', async () => {
       download.disabled = true;
+      const requestToken = state.token;
       try {
-        const res = await api(`/api/items/${encodeURIComponent(item.id)}/download`);
+        const res = await api(`/api/items/${encodeURIComponent(item.id)}/download`, { token: requestToken });
+        if (requestToken !== state.token) return;
+        if (res.status === 401) {
+          invalidateSession('连接已失效，请重新输入访问码', requestToken);
+          return;
+        }
         if (!res.ok) {
           const data = await res.json().catch(() => ({}));
           throw new Error(data.error || '下载失败');
         }
         const blob = await res.blob();
+        if (requestToken !== state.token) return;
         const url = URL.createObjectURL(blob);
         const anchor = document.createElement('a');
         anchor.href = url;
@@ -763,7 +923,13 @@ function buildItem(item) {
   del.textContent = '删除';
   del.addEventListener('click', async () => {
     if (!confirm('删除这条内容吗？')) return;
-    const res = await api(`/api/delete/${encodeURIComponent(item.id)}`, { method: 'POST' });
+    const requestToken = state.token;
+    const res = await api(`/api/delete/${encodeURIComponent(item.id)}`, { method: 'POST', token: requestToken });
+    if (requestToken !== state.token) return;
+    if (res.status === 401) {
+      invalidateSession('连接已失效，请重新输入访问码', requestToken);
+      return;
+    }
     if (res.ok) {
       state.items = state.items.filter((entry) => entry.id !== item.id);
       renderItems();
@@ -787,12 +953,18 @@ async function loadImage(id, img) {
     return;
   }
   const request = { canceled: false };
+  const requestToken = state.token;
   request.promise = (async () => {
     try {
-      const res = await api(`/api/items/${encodeURIComponent(id)}/image`);
+      const res = await api(`/api/items/${encodeURIComponent(id)}/image`, { token: requestToken });
+      if (requestToken !== state.token) return;
+      if (res.status === 401) {
+        invalidateSession('连接已失效，请重新输入访问码', requestToken);
+        return;
+      }
       if (!res.ok) throw new Error('图片加载失败');
       const blob = await res.blob();
-      if (request.canceled || !img.isConnected) return;
+      if (request.canceled || !img.isConnected || requestToken !== state.token) return;
       const objectUrl = URL.createObjectURL(blob);
       state.imageUrls.set(id, objectUrl);
       img.src = objectUrl;
@@ -842,9 +1014,15 @@ async function pollLoop() {
   const generation = state.pollGeneration;
   while (generation === state.pollGeneration && state.token) {
     await new Promise((resolve) => {
-      state.pollTimer = setTimeout(resolve, POLL_MS);
+      state.pollResolve = resolve;
+      state.pollTimer = setTimeout(() => {
+        state.pollTimer = null;
+        state.pollResolve = null;
+        resolve();
+      }, POLL_MS);
     });
     state.pollTimer = null;
+    state.pollResolve = null;
     if (generation !== state.pollGeneration || !state.token) return;
     await refreshItems(false);
   }
@@ -854,11 +1032,22 @@ function cancelPolling() {
   state.pollGeneration += 1;
   if (state.pollTimer) clearTimeout(state.pollTimer);
   state.pollTimer = null;
+  if (state.pollResolve) {
+    const resolve = state.pollResolve;
+    state.pollResolve = null;
+    resolve();
+  }
 }
 
-function invalidateSession(message = '连接已失效，请重新输入访问码') {
+function invalidateSession(message = '连接已失效，请重新输入访问码', expectedToken = state.token) {
+  if (expectedToken && expectedToken !== state.token) return;
   state.token = '';
   localStorage.removeItem(TOKEN_KEY);
+  state.revision = 0;
+  localStorage.removeItem(REVISION_KEY);
+  state.items = [];
+  state.connected = false;
+  state.connectUrl = '';
   renderLock();
   queueMicrotask(() => {
     const error = document.querySelector('#lock-error');
@@ -866,8 +1055,8 @@ function invalidateSession(message = '连接已失效，请重新输入访问码
   });
 }
 
-async function handleAuthError(error) {
-  if (error.status === 401) invalidateSession(error.message);
+async function handleAuthError(error, expectedToken = state.token) {
+  if (error.status === 401) invalidateSession(error.message, expectedToken);
 }
 
 function appendSuggestedText(text) {
@@ -906,7 +1095,6 @@ async function bootApp() {
       const res = await api('/api/state');
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.ok) {
-        state.accessCode = '';
         state.maxItemBytes = data.config.maxItemBytes;
         state.maxTextChars = data.config.maxTextChars;
         await startApp(data.deviceId);
@@ -919,4 +1107,5 @@ async function bootApp() {
   renderLock();
 }
 
+bindPaste();
 bootApp();

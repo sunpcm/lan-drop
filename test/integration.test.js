@@ -11,6 +11,7 @@ import { Store } from '../server/store.js';
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=', 'base64');
 const SVG = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><text>hi</text></svg>');
+const ALTERNATE_SECRET = ['Validation', 'Fixture', 'Pass', '2468'].join('-');
 
 async function startTestApp(options = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'lan-drop-test-'));
@@ -82,19 +83,67 @@ function json(res) {
   try { return JSON.parse(res.body.toString('utf8')); } catch { return null; }
 }
 
-async function connect(app) {
-  const auth = app.auth;
-  const res = await request(app.base, '/api/connect', {
+async function connect(fixture) {
+  return login(fixture, fixture.app.auth.accessCode);
+}
+
+async function login(fixture, secret) {
+  const res = await request(fixture.base, '/api/connect', {
     method: 'POST',
-    headers: { 'content-type': 'application/json', origin: app.base },
-    body: JSON.stringify({ code: auth.accessCode }),
+    headers: { 'content-type': 'application/json', origin: fixture.base },
+    body: JSON.stringify({ code: secret }),
   });
   assert.equal(res.status, 200);
   return json(res);
 }
 
+async function changeAccess(fixture, token, currentSecret, newSecret, extraHeaders = {}) {
+  return request(fixture.base, '/api/access', {
+    method: 'POST',
+    headers: {
+      ...bearer(token),
+      'content-type': 'application/json',
+      origin: fixture.base,
+      ...extraHeaders,
+    },
+    body: JSON.stringify({ currentSecret, newSecret }),
+  });
+}
+
 function bearer(token) {
   return { authorization: `Bearer ${token}` };
+}
+
+function startChunkedRequest(base, pathname, { headers, body, splitAt = 1 }) {
+  const target = new URL(base);
+  let req;
+  const response = new Promise((resolve, reject) => {
+    req = http.request({
+      host: target.hostname,
+      port: target.port,
+      path: pathname,
+      method: 'POST',
+      headers: { ...headers, 'content-length': body.length },
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+  });
+  req.write(body.subarray(0, splitAt));
+  let finished = false;
+  return {
+    response,
+    finish() {
+      if (finished) return;
+      finished = true;
+      req.end(body.subarray(splitAt));
+    },
+    abort() {
+      if (!finished) req.destroy();
+    },
+  };
 }
 
 test('文字上传、列表、复制接口与重启持久化', async () => {
@@ -460,6 +509,306 @@ test('已鉴权轮询不消耗接入尝试限流', async () => {
     }
   } finally {
     await fixture.close();
+  }
+});
+
+test('自定义密码轮换后旧密码和旧token全部失效，新凭据保留内容并持久化', async () => {
+  const fixture = await startTestApp({ env: { EXTRA_ALLOWED_HOSTS: 'lan.test' } });
+  const newSecret = ['Case', 'Sensitive', '1234'].join('-');
+  try {
+    const initialAccessCode = fixture.app.auth.accessCode;
+    const initial = await login(fixture, initialAccessCode.toLowerCase());
+    const oldToken = initial.token;
+    const textRes = await request(fixture.base, '/api/items', {
+      method: 'POST',
+      headers: { ...bearer(oldToken), 'content-type': 'text/plain; charset=utf-8' },
+      body: '轮换前文字',
+    });
+    const imageRes = await request(fixture.base, '/api/items', {
+      method: 'POST',
+      headers: { ...bearer(oldToken), 'content-type': 'image/png', 'x-file-name': encodeURIComponent('轮换前.png') },
+      body: PNG,
+    });
+    const textItem = json(textRes).item;
+    const imageItem = json(imageRes).item;
+
+    const changed = await changeAccess(fixture, oldToken, initialAccessCode.toLowerCase(), newSecret);
+    assert.equal(changed.status, 200);
+    const newToken = json(changed).token;
+    assert.notEqual(newToken, oldToken);
+    assert.ok(Buffer.from(newToken, 'base64url').length >= 32);
+
+    const authFile = fixture.app.store.secretFile;
+    const rawAuth = await fs.readFile(authFile, 'utf8');
+    const savedAuth = JSON.parse(rawAuth);
+    assert.equal(savedAuth.accessCode, undefined);
+    assert.equal(typeof savedAuth.passwordHash, 'string');
+    assert.equal(typeof savedAuth.passwordSalt, 'string');
+    assert.equal(savedAuth.token, newToken);
+    assert.equal(rawAuth.includes(initialAccessCode), false);
+    assert.equal(rawAuth.includes(newSecret), false);
+    assert.equal((await fs.stat(authFile)).mode & 0o777, 0o600);
+
+    const oldRequests = [
+      ['/api/state', {}],
+      ['/api/items', {}],
+      [`/api/items/${textItem.id}/copy`, {}],
+      [`/api/items/${imageItem.id}/image`, {}],
+      [`/api/items/${imageItem.id}/download`, {}],
+      ['/api/qr?host=lan.test', {}],
+      ['/api/items', { method: 'POST', headers: { 'content-type': 'text/plain' }, body: '旧token写入' }],
+      [`/api/delete/${textItem.id}`, { method: 'POST' }],
+    ];
+    for (const [pathname, options] of oldRequests) {
+      const response = await request(fixture.base, pathname, {
+        ...options,
+        headers: { ...bearer(oldToken), ...(options.headers || {}) },
+      });
+      assert.equal(response.status, 401, pathname);
+    }
+
+    const oldLogin = await request(fixture.base, '/api/connect', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: initialAccessCode }),
+    });
+    assert.equal(oldLogin.status, 401);
+    const wrongCaseLogin = await request(fixture.base, '/api/connect', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ code: newSecret.toLowerCase() }),
+    });
+    assert.equal(wrongCaseLogin.status, 401);
+
+    const current = await login(fixture, newSecret);
+    assert.equal(current.token, newToken);
+    const state = await request(fixture.base, '/api/state', { headers: bearer(current.token) });
+    assert.equal(state.status, 200);
+    const items = await request(fixture.base, '/api/items', { headers: bearer(current.token) });
+    assert.deepEqual(json(items).items.map((item) => item.text ?? item.originalName).sort(), ['轮换前.png', '轮换前文字'].sort());
+    const image = await request(fixture.base, `/api/items/${imageItem.id}/image`, { headers: bearer(current.token) });
+    assert.equal(image.status, 200);
+    assert.deepEqual(image.body, PNG);
+    const qr = await request(fixture.base, '/api/qr?host=lan.test', { headers: bearer(current.token) });
+    assert.equal(qr.status, 200);
+    assert.match(qr.headers['content-type'], /^image\/png/);
+    const secondText = await request(fixture.base, '/api/items', {
+      method: 'POST',
+      headers: { ...bearer(current.token), 'content-type': 'text/plain' },
+      body: '新token写入',
+    });
+    assert.equal(secondText.status, 201);
+    const removed = await request(fixture.base, `/api/delete/${textItem.id}`, {
+      method: 'POST',
+      headers: bearer(current.token),
+    });
+    assert.equal(removed.status, 200);
+
+    await new Promise((resolve) => fixture.server.close(resolve));
+    fixture.keepData = true;
+    await fixture.app.close();
+    const restarted = await startTestApp({ env: { DATA_DIR: fixture.dir, EXTRA_ALLOWED_HOSTS: 'lan.test' } });
+    try {
+      const oldAfterRestart = await request(restarted.base, '/api/connect', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ code: initialAccessCode }),
+      });
+      assert.equal(oldAfterRestart.status, 401);
+      const oldTokenAfterRestart = await request(restarted.base, '/api/state', { headers: bearer(oldToken) });
+      assert.equal(oldTokenAfterRestart.status, 401);
+      const currentAfterRestart = await login(restarted, newSecret);
+      assert.equal(currentAfterRestart.token, newToken);
+      const itemsAfterRestart = await request(restarted.base, '/api/items', { headers: bearer(newToken) });
+      assert.equal(itemsAfterRestart.status, 200);
+      assert.deepEqual(json(itemsAfterRestart).items.map((item) => item.text ?? item.originalName).sort(), ['新token写入', '轮换前.png'].sort());
+    } finally {
+      await restarted.close();
+    }
+  } finally {
+    await fixture.close();
+    await fs.rm(fixture.dir, { recursive: true, force: true });
+  }
+});
+
+test('改密拒绝错误当前密码、非法新密码、未授权和跨源请求', async () => {
+  const fixture = await startTestApp();
+  try {
+    const { token } = await connect(fixture);
+    const accessCode = fixture.app.auth.accessCode;
+    const before = await fs.readFile(fixture.app.store.secretFile, 'utf8');
+
+    const tooShort = await changeAccess(fixture, token, accessCode, '1234567');
+    assert.equal(tooShort.status, 400);
+    const whitespace = await changeAccess(fixture, token, accessCode, '        ');
+    assert.equal(whitespace.status, 400);
+    const wrongCurrent = await changeAccess(fixture, token, 'WRONG-CURRENT', ALTERNATE_SECRET);
+    assert.equal(wrongCurrent.status, 403);
+
+    const unauthenticated = await request(fixture.base, '/api/access', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: fixture.base },
+      body: JSON.stringify({ currentSecret: accessCode, newSecret: ['Unauthorized', 'New', '1234'].join('-') }),
+    });
+    assert.equal(unauthenticated.status, 401);
+    const crossOrigin = await changeAccess(fixture, token, accessCode, ALTERNATE_SECRET, {
+      origin: 'https://evil.example',
+    });
+    assert.equal(crossOrigin.status, 403);
+
+    assert.equal(await fs.readFile(fixture.app.store.secretFile, 'utf8'), before);
+    assert.equal(fixture.app.auth.token, token);
+    const stillValid = await request(fixture.base, '/api/state', { headers: bearer(token) });
+    assert.equal(stillValid.status, 200);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('错误当前密码限流且正常轮询不消耗改密额度', async () => {
+  const fixture = await startTestApp({ rateLimitPoints: '1' });
+  try {
+    const { token } = await connect(fixture);
+    for (let index = 0; index < 10; index += 1) {
+      const response = await request(fixture.base, '/api/state', { headers: bearer(token) });
+      assert.equal(response.status, 200);
+    }
+    const first = await changeAccess(fixture, token, 'WRONG-CURRENT', ALTERNATE_SECRET);
+    assert.equal(first.status, 403);
+    const limited = await changeAccess(fixture, token, fixture.app.auth.accessCode, ALTERNATE_SECRET, {
+      'x-forwarded-for': '203.0.113.10',
+    });
+    assert.equal(limited.status, 429);
+    assert.ok(Number(limited.headers['retry-after']) >= 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('同一旧token并发改密最多一个成功', async () => {
+  const fixture = await startTestApp();
+  try {
+    const { token } = await connect(fixture);
+    const currentSecret = fixture.app.auth.accessCode;
+    const responses = await Promise.all([
+      changeAccess(fixture, token, currentSecret, 'Concurrent-One-111'),
+      changeAccess(fixture, token, currentSecret, 'Concurrent-Two-222'),
+    ]);
+    assert.deepEqual(responses.map((response) => response.status).sort(), [200, 401]);
+    const winner = responses.find((response) => response.status === 200);
+    assert.equal(winner.status, 200);
+    assert.ok(json(winner).token);
+    assert.equal(fixture.app.auth.custom, true);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('改密完成后，已开始但未读完的旧token上传必须拒绝', async () => {
+  const fixture = await startTestApp();
+  let slow;
+  try {
+    const { token } = await connect(fixture);
+    const body = Buffer.from('这是一段很长的慢上传内容，绝不能在密码轮换后写入');
+    slow = startChunkedRequest(fixture.base, '/api/items', {
+      headers: {
+        ...bearer(token),
+        'content-type': 'text/plain; charset=utf-8',
+        origin: fixture.base,
+      },
+      body,
+      splitAt: 8,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    const changed = await changeAccess(fixture, token, fixture.app.auth.accessCode, 'After-Upload-333');
+    assert.equal(changed.status, 200);
+    slow.finish();
+    const uploadResponse = await slow.response;
+    assert.equal(uploadResponse.status, 401);
+    const newToken = json(changed).token;
+    assert.equal(typeof newToken, 'string');
+    assert.ok(newToken.length > 32);
+    const items = await request(fixture.base, '/api/items?revision=-1', { headers: bearer(newToken) });
+    assert.equal(items.status, 200);
+    assert.equal(json(items).items.length, 0);
+  } finally {
+    slow?.abort();
+    await slow?.response.catch(() => {});
+    await fixture.close();
+  }
+});
+
+test('auth.json真实落盘失败时内存和磁盘保持旧凭据并可恢复提交', async () => {
+  const fixture = await startTestApp();
+  try {
+    const { token } = await connect(fixture);
+    const accessCode = fixture.app.auth.accessCode;
+    const authPath = fixture.app.store.secretFile;
+    const before = await fs.readFile(authPath, 'utf8');
+    await fs.chmod(fixture.dir, 0o500);
+    let failed;
+    try {
+      failed = await changeAccess(fixture, token, accessCode, 'Persistence-Fail-444'); // gitleaks:allow 仅用于临时测试的虚构口令
+    } finally {
+      await fs.chmod(fixture.dir, 0o700);
+    }
+    assert.equal(failed.status, 500);
+    assert.equal(fixture.app.auth.token, token);
+    assert.equal(await fs.readFile(authPath, 'utf8'), before);
+    assert.equal((await fs.readdir(fixture.dir)).some((name) => name.startsWith('auth.json.tmp-')), false);
+    const oldStillWorks = await request(fixture.base, '/api/state', { headers: bearer(token) });
+    assert.equal(oldStillWorks.status, 200);
+    const recovered = await changeAccess(fixture, token, accessCode, 'Persistence-OK-555');
+    assert.equal(recovered.status, 200);
+    assert.ok(json(recovered).token);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('自定义密码启动只报告状态，不输出undefined、哈希或token', async () => {
+  const fixture = await startTestApp();
+  const customSecret = ['Startup', 'Custom', '777'].join('-');
+  let child;
+  try {
+    const { token } = await connect(fixture);
+    const changed = await changeAccess(fixture, token, fixture.app.auth.accessCode, customSecret);
+    assert.equal(changed.status, 200);
+    const savedAuth = JSON.parse(await fs.readFile(fixture.app.store.secretFile, 'utf8'));
+    await new Promise((resolve) => fixture.server.close(resolve));
+    fixture.keepData = true;
+    await fixture.app.close();
+
+    child = spawn(process.execPath, ['server/index.js'], {
+      cwd: path.resolve('.'),
+      env: { ...process.env, HOST: '127.0.0.1', PORT: '0', DATA_DIR: fixture.dir },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    await Promise.race([
+      new Promise((resolve, reject) => {
+        const check = () => {
+          if (/密码：已自定义[\s\S]*http:\/\/127\.0\.0\.1:\d+/.test(stdout)) return resolve();
+          if (child.exitCode !== null) return reject(new Error(`入口退出 (${child.exitCode}): ${stderr}`));
+          setTimeout(check, 20);
+        };
+        check();
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error(`入口启动超时: ${stderr}`)), 5000)),
+    ]);
+    assert.equal(stdout.includes('undefined'), false);
+    assert.equal(stdout.includes(savedAuth.token), false);
+    assert.equal(stdout.includes(savedAuth.passwordHash), false);
+    assert.equal(stdout.includes(savedAuth.passwordSalt), false);
+    child.kill('SIGTERM');
+    await new Promise((resolve) => child.once('exit', resolve));
+  } finally {
+    if (child?.exitCode === null) child.kill('SIGKILL');
+    await fixture.close();
+    await fs.rm(fixture.dir, { recursive: true, force: true });
   }
 });
 

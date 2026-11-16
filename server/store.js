@@ -238,8 +238,13 @@ export class Store {
   async saveAuth(auth) {
     const tmp = `${this.secretFile}.tmp-${randomId(6)}`;
     const body = `${JSON.stringify(auth, null, 2)}\n`;
-    await this.fs.writeFile(tmp, body, { encoding: 'utf8', mode: 0o600 });
-    await this.fs.rename(tmp, this.secretFile);
+    try {
+      await this.fs.writeFile(tmp, body, { encoding: 'utf8', mode: 0o600 });
+      await this.fs.rename(tmp, this.secretFile);
+    } catch (error) {
+      await this.fs.rm(tmp, { force: true }).catch(() => {});
+      throw error;
+    }
     await this.fs.chmod(this.secretFile, 0o600).catch(() => {});
   }
 

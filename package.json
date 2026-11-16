@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node server/index.js",
     "test": "node --test",
-    "check": "node --check server/index.js && node --check server/app.js && node --check server/config.js && node --check server/store.js && node --check server/security.js && node --check public/app.js"
+    "check": "node --check server/index.js && node --check server/app.js && node --check server/auth.js && node --check server/config.js && node --check server/store.js && node --check server/security.js && node --check public/app.js"
   },
   "dependencies": {
     "qrcode": "^1.5.4"
